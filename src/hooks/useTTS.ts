@@ -1,17 +1,16 @@
 /**
  * useTTS.ts
- * Three-layer TTS strategy:
- *   1. Bhashini API  — native Indian language audio via /api/tts (best quality)
- *   2. Web Speech API with correct BCP-47 language code (e.g. hi-IN, ta-IN)
- *   3. Web Speech API in English (last resort fallback)
+ * Guaranteed Indian language audio via Google Translate TTS proxy.
  *
- * Returns speak(text, lang?), stop(), isSpeaking, isLoadingBhashini
+ * Strategy:
+ *   1. Call /api/tts?text=...&lang=hi  (Google TTS proxy — works on all devices)
+ *   2. Play returned MP3 audio via HTMLAudioElement
+ *   3. Fallback to Web Speech API if proxy fails
  */
 
 import { useState, useCallback, useEffect, useRef } from 'react';
 
-// BCP-47 language codes for Web Speech API
-const LANG_CODES: Record<string, string> = {
+const LANG_BCP47: Record<string, string> = {
   en: 'en-US', hi: 'hi-IN', bn: 'bn-IN', ta: 'ta-IN',
   te: 'te-IN', mr: 'mr-IN', gu: 'gu-IN', kn: 'kn-IN',
   ml: 'ml-IN', pa: 'pa-IN', or: 'or-IN', ur: 'ur-IN',
@@ -19,123 +18,133 @@ const LANG_CODES: Record<string, string> = {
 
 interface UseTTSReturn {
   isSpeaking: boolean;
-  isLoadingBhashini: boolean;
+  isLoadingBhashini: boolean; // kept for prop compatibility
   speak: (text: string, lang?: string) => void;
   stop: () => void;
   supported: boolean;
 }
 
 export function useTTS(): UseTTSReturn {
-  const [isSpeaking, setIsSpeaking] = useState(false);
-  const [isLoadingBhashini, setIsLoadingBhashini] = useState(false);
+  const [isSpeaking,  setIsSpeaking]  = useState(false);
+  const [isLoading,   setIsLoading]   = useState(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const supported = typeof window !== 'undefined' && 'speechSynthesis' in window;
 
   const stop = useCallback(() => {
-    // Stop Bhashini audio
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.currentTime = 0;
+      audioRef.current = null;
     }
-    // Stop Web Speech
     if (supported) window.speechSynthesis.cancel();
     setIsSpeaking(false);
-    setIsLoadingBhashini(false);
+    setIsLoading(false);
   }, [supported]);
 
-  // Try Bhashini TTS first, fall back to Web Speech
   const speak = useCallback((text: string, lang = 'en') => {
     stop();
 
-    // English — always use Web Speech (no Bhashini needed)
+    // For English use Web Speech directly (faster)
     if (lang === 'en') {
       speakWebSpeech(text, 'en-US', setIsSpeaking);
       return;
     }
 
-    // For Indian languages — try Bhashini first
-    setIsLoadingBhashini(true);
+    // For all Indian languages — use Google TTS proxy
+    setIsLoading(true);
 
-    fetch('/api/tts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, language: lang, gender: 'female' }),
-    })
-      .then(async (res) => {
-        if (!res.ok) throw new Error('Bhashini TTS not available');
-        return res.json() as Promise<{ audioBase64: string; mimeType: string }>;
-      })
-      .then(({ audioBase64, mimeType }) => {
-        setIsLoadingBhashini(false);
-        // Play Bhashini audio
-        const byteChars = atob(audioBase64);
-        const byteNums  = Array.from(byteChars).map(c => c.charCodeAt(0));
-        const blob      = new Blob([new Uint8Array(byteNums)], { type: mimeType });
-        const url       = URL.createObjectURL(blob);
-        const audio     = new Audio(url);
-        audioRef.current = audio;
-        audio.onplay  = () => setIsSpeaking(true);
-        audio.onended = () => { setIsSpeaking(false); URL.revokeObjectURL(url); };
-        audio.onerror = () => {
-          setIsSpeaking(false);
-          URL.revokeObjectURL(url);
-          // Fallback to Web Speech
-          speakWebSpeech(text, LANG_CODES[lang] || 'en-US', setIsSpeaking);
-        };
-        audio.play().catch(() => {
-          speakWebSpeech(text, LANG_CODES[lang] || 'en-US', setIsSpeaking);
-        });
-      })
-      .catch(() => {
-        setIsLoadingBhashini(false);
-        // Fallback: Web Speech with Indian language voice
-        const bcp47 = LANG_CODES[lang] || 'en-US';
-        speakWebSpeech(text, bcp47, setIsSpeaking);
+    // Build URL for GET request to our proxy
+    const params = new URLSearchParams({ text, lang });
+    const audioUrl = `/api/tts?${params.toString()}`;
+
+    const audio = new Audio(audioUrl);
+    audioRef.current = audio;
+
+    audio.oncanplaythrough = () => {
+      setIsLoading(false);
+      setIsSpeaking(true);
+      audio.play().catch(() => {
+        // Autoplay blocked — try Web Speech fallback
+        setIsSpeaking(false);
+        speakWebSpeechFallback(text, lang, setIsSpeaking);
       });
+    };
+
+    audio.onended = () => setIsSpeaking(false);
+
+    audio.onerror = () => {
+      setIsLoading(false);
+      setIsSpeaking(false);
+      // Fallback to Web Speech
+      speakWebSpeechFallback(text, lang, setIsSpeaking);
+    };
+
+    // Trigger load
+    audio.load();
+
+    // Timeout — if no response in 8s, fall back
+    const timeout = setTimeout(() => {
+      if (isLoading) {
+        stop();
+        speakWebSpeechFallback(text, lang, setIsSpeaking);
+      }
+    }, 8000);
+
+    audio.oncanplaythrough = () => {
+      clearTimeout(timeout);
+      setIsLoading(false);
+      setIsSpeaking(true);
+      audio.play().catch(() => {
+        setIsSpeaking(false);
+        speakWebSpeechFallback(text, lang, setIsSpeaking);
+      });
+    };
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stop]);
 
   useEffect(() => () => { stop(); }, [stop]);
 
-  return { isSpeaking, isLoadingBhashini, speak, stop, supported };
+  return {
+    isSpeaking,
+    isLoadingBhashini: isLoading, // alias for ResultsScreen prop
+    speak,
+    stop,
+    supported,
+  };
+}
+
+// Web Speech with Indian language voice
+function speakWebSpeechFallback(
+  text: string,
+  lang: string,
+  setIsSpeaking: (v: boolean) => void,
+) {
+  if (!window.speechSynthesis) return;
+  const bcp47  = LANG_BCP47[lang] || 'en-US';
+  const voices = window.speechSynthesis.getVoices();
+  const voice  = voices.find(v => v.lang === bcp47)
+              || voices.find(v => v.lang.startsWith(bcp47.slice(0, 2)))
+              || null;
+  speakWebSpeech(text, bcp47, setIsSpeaking, voice || undefined);
 }
 
 function speakWebSpeech(
   text: string,
   bcp47: string,
   setIsSpeaking: (v: boolean) => void,
+  voice?: SpeechSynthesisVoice,
 ) {
   if (!window.speechSynthesis) return;
   window.speechSynthesis.cancel();
-
-  const trySpeak = (voiceLang: string) => {
-    const voices  = window.speechSynthesis.getVoices();
-    const voice   = voices.find(v => v.lang === voiceLang)
-                 || voices.find(v => v.lang.startsWith(voiceLang.slice(0, 2)))
-                 || null;
-
-    const u     = new SpeechSynthesisUtterance(text);
-    u.lang      = voiceLang;
-    u.rate      = 0.82;
-    u.pitch     = 1.05;
-    u.volume    = 1;
-    if (voice) u.voice = voice;
-    u.onstart   = () => setIsSpeaking(true);
-    u.onend     = () => setIsSpeaking(false);
-    u.onerror   = () => {
-      setIsSpeaking(false);
-      // Last resort: English
-      if (voiceLang !== 'en-US') speakWebSpeech(text, 'en-US', setIsSpeaking);
-    };
-    window.speechSynthesis.speak(u);
-  };
-
-  // Voices may not be loaded yet on first call
-  if (window.speechSynthesis.getVoices().length === 0) {
-    window.speechSynthesis.onvoiceschanged = () => {
-      window.speechSynthesis.onvoiceschanged = null;
-      trySpeak(bcp47);
-    };
-  } else {
-    trySpeak(bcp47);
-  }
+  const u    = new SpeechSynthesisUtterance(text);
+  u.lang     = bcp47;
+  u.rate     = 0.82;
+  u.pitch    = 1.0;
+  u.volume   = 1;
+  if (voice) u.voice = voice;
+  u.onstart  = () => setIsSpeaking(true);
+  u.onend    = () => setIsSpeaking(false);
+  u.onerror  = () => setIsSpeaking(false);
+  window.speechSynthesis.speak(u);
 }

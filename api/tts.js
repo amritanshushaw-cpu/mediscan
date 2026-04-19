@@ -1,119 +1,83 @@
 /**
  * api/tts.js
- * Bhashini Text-to-Speech serverless endpoint.
- * POST /api/tts  { text: "...", language: "hi" }
- * Returns: { audioBase64: "...", mimeType: "audio/wav" }
- * Falls back gracefully if Bhashini keys are not set.
+ * Server-side proxy for Google Translate TTS.
+ * - No API key needed
+ * - Supports all 12 Indian languages
+ * - Works on every device and browser
+ * - Bypasses CORS restriction that blocks direct browser calls
+ *
+ * GET /api/tts?text=...&lang=hi
+ * Returns audio/mpeg stream directly
  */
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+  if (req.method !== 'GET') return res.status(405).json({ error: 'Use GET' });
 
-  const body = req.body || {};
-  const text     = body.text;
-  const language = body.language || 'hi';
-  const gender   = body.gender   || 'female';
+  const text = req.query.text;
+  const lang = req.query.lang || 'hi';
 
-  if (!text || !text.trim()) return res.status(400).json({ error: 'Text required.' });
+  if (!text || !text.trim()) return res.status(400).json({ error: 'text param required' });
 
-  const bhashiniKey    = process.env.BHASHINI_API_KEY;
-  const bhashiniUserId = process.env.BHASHINI_USER_ID;
-
-  if (!bhashiniKey || !bhashiniUserId) {
-    return res.status(503).json({ error: 'Bhashini TTS not configured. Use Web Speech API fallback.' });
-  }
+  // Split into chunks of max 200 chars (Google TTS limit per request)
+  const chunks = splitText(String(text), 200);
 
   try {
-    // Step 1: Get TTS pipeline config
-    const pipelineRes = await fetch('https://meity-auth.ulcacontrib.org/ulca/apis/v0/model/getModelsPipeline', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'userID': bhashiniUserId,
-        'ulcaApiKey': bhashiniKey
-      },
-      body: JSON.stringify({
-        pipelineTasks: [{
-          taskType: 'tts',
-          config: {
-            language: { sourceLanguage: language },
-            gender: gender
-          }
-        }],
-        pipelineRequestConfig: { pipelineId: 'ai4bharat/indic-tts' }
-      })
-    });
+    const audioBuffers = [];
 
-    if (!pipelineRes.ok) {
-      const err = await pipelineRes.text();
-      console.error('Bhashini pipeline config error:', err);
-      return res.status(502).json({ error: 'Bhashini pipeline error.' });
+    for (const chunk of chunks) {
+      const url = 'https://translate.google.com/translate_tts'
+        + '?ie=UTF-8'
+        + '&q=' + encodeURIComponent(chunk)
+        + '&tl=' + encodeURIComponent(lang)
+        + '&client=tw-ob'
+        + '&ttsspeed=0.85';
+
+      const response = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Referer':    'https://translate.google.com/',
+          'Accept':     'audio/webm,audio/ogg,audio/wav,audio/*;q=0.9,*/*;q=0.5',
+        }
+      });
+
+      if (!response.ok) {
+        console.error('Google TTS error:', response.status, await response.text());
+        return res.status(502).json({ error: 'TTS fetch failed: ' + response.status });
+      }
+
+      const buf = await response.arrayBuffer();
+      audioBuffers.push(Buffer.from(buf));
     }
 
-    const pipelineData = await pipelineRes.json();
-    const config = pipelineData.pipelineResponseConfig &&
-                   pipelineData.pipelineResponseConfig[0] &&
-                   pipelineData.pipelineResponseConfig[0].config &&
-                   pipelineData.pipelineResponseConfig[0].config[0];
-
-    if (!config) return res.status(502).json({ error: 'Bhashini returned empty pipeline config.' });
-
-    const serviceId  = config.serviceId;
-    const callbackUrl = pipelineData.pipelineInferenceAPIEndPoint.callbackUrl;
-    const inferKey   = pipelineData.pipelineInferenceAPIEndPoint.inferenceApiKey.value;
-
-    // Step 2: Call TTS inference
-    const inferRes = await fetch(callbackUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': inferKey
-      },
-      body: JSON.stringify({
-        pipelineTasks: [{
-          taskType: 'tts',
-          config: {
-            language: { sourceLanguage: language },
-            serviceId: serviceId,
-            gender: gender,
-            samplingRate: 8000
-          },
-          input: [{ source: text }]
-        }],
-        inputData: { input: [{ source: text }] }
-      })
-    });
-
-    if (!inferRes.ok) {
-      const err = await inferRes.text();
-      console.error('Bhashini TTS inference error:', err);
-      return res.status(502).json({ error: 'Bhashini TTS inference failed.' });
-    }
-
-    const inferData = await inferRes.json();
-    const audioContent = inferData.pipelineResponse &&
-                         inferData.pipelineResponse[0] &&
-                         inferData.pipelineResponse[0].audio &&
-                         inferData.pipelineResponse[0].audio[0] &&
-                         inferData.pipelineResponse[0].audio[0].audioContent;
-
-    if (!audioContent) {
-      console.error('No audio in Bhashini response:', JSON.stringify(inferData).slice(0, 300));
-      return res.status(502).json({ error: 'No audio returned from Bhashini.' });
-    }
-
-    return res.status(200).json({
-      audioBase64: audioContent,
-      mimeType: 'audio/wav',
-      language: language
-    });
+    const combined = Buffer.concat(audioBuffers);
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Length', combined.length);
+    res.setHeader('Cache-Control', 'public, max-age=86400'); // cache 24h
+    return res.status(200).send(combined);
 
   } catch (err) {
-    console.error('[Bhashini TTS fatal]', err && err.message);
+    console.error('[TTS proxy error]', err && err.message);
     return res.status(500).json({ error: 'TTS error: ' + (err && err.message || 'unknown') });
   }
 };
+
+// Split text at sentence boundaries to stay under 200 char limit
+function splitText(text, maxLen) {
+  if (text.length <= maxLen) return [text];
+  const chunks = [];
+  const sentences = text.split(/(?<=[।.!?])\s+/);
+  let current = '';
+  for (const s of sentences) {
+    if ((current + ' ' + s).trim().length > maxLen) {
+      if (current) chunks.push(current.trim());
+      current = s;
+    } else {
+      current = (current + ' ' + s).trim();
+    }
+  }
+  if (current) chunks.push(current.trim());
+  return chunks.length ? chunks : [text.slice(0, maxLen)];
+}
